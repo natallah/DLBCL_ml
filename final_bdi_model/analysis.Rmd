@@ -1,0 +1,775 @@
+---
+title: "BDI and RNA-seq Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Notebook for combining RNA-seq and BDI variables
+
+## Load libraries
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(knitr)
+library(rgl)
+library(pca3d)
+knit_hooks$set(webgl = hook_webgl)
+
+library(plyr)
+library(tidyverse)
+library(ggrepel)
+
+# This copies the code provided by Vincent Q. Vu to avoid a dependance on devtools
+# This file is licensed under the GPU GPL.
+source("ggbiplot.r")
+
+library(PRROC)
+library(caret)
+```
+
+## Preprocess Data
+
+Load and combine data for the **BDI** and **RNA-seq** variables. Only genes identified by **both** *edgeR* and *DEseq2* are used to build models later in this notebook. Genes identified using the decision tree bootstrapping method are included here as well.
+
+```{r load_data, message = FALSE, warning=FALSE}
+canine <- read_csv("canineCHOP81.csv")
+mapping <- read_csv("../data/canineDLBCL_RNA-seqToOldSampleMapping.csv")
+rna <- read_tsv("../data/counts_FPKM.tsv.gz")
+
+# Read DE analysis, na.omit is to ensure both DESeq2 and EdgeR agree
+resistant_v_sensitive_all <- read_tsv("resistant_vs_sensitive_all.csv") %>%
+  select(Gene_ID, DE_in_Method, DESeq2_log2FC, EdgeR_log2FC, `Gene type`) %>%
+  filter(`Gene type` == "protein_coding") %>%
+  na.omit()
+
+resistant_v_sensitive_pre <- read_tsv("resistant_vs_sensitive_pre.csv") %>%
+  select(Gene_ID, DE_in_Method, DESeq2_log2FC, EdgeR_log2FC, `Gene type`) %>%
+  filter(`Gene type` == "protein_coding") %>%
+  na.omit()
+
+# Flip the data and merge
+rna_all <-
+  rna %>%
+  gather(sample, fpkm, -Gene_ID) %>%
+  filter(Gene_ID %in% resistant_v_sensitive_all$Gene_ID) %>%
+  spread(Gene_ID, fpkm) %>%
+  merge(mapping, by = "sample") %>%
+  as_tibble()
+
+rna_pre <-
+  rna %>%
+  gather(sample, fpkm, -Gene_ID) %>%
+  filter(Gene_ID %in% c(resistant_v_sensitive_pre$Gene_ID)) %>%
+  spread(Gene_ID, fpkm) %>%
+  merge(mapping, by = "sample") %>%
+  as_tibble()
+
+rna_combined <-
+  rna %>%
+  gather(sample, fpkm, -Gene_ID) %>%
+  filter(Gene_ID %in% c(resistant_v_sensitive_pre$Gene_ID,
+                        resistant_v_sensitive_all$Gene_ID)) %>%
+  spread(Gene_ID, fpkm) %>%
+  merge(mapping, by = "sample") %>%
+  as_tibble()
+
+# Cleanup
+rna_all <-
+  rna_all %>%
+  filter(Condition == "Pre") %>%
+  select(-sample, -Dog_Name, -Breed, -`BDI outcome`, -Condition) %>%
+  mutate(Clinical_Outcome = factor(Clinical_Outcome)) %>%
+  rename(ClinicalOutcome = Clinical_Outcome)
+
+rna_pre <-
+  rna_pre %>%
+  select(-sample, -Dog_Name, -Breed, -`BDI outcome`) %>%
+  rename(ClinicalOutcome = Clinical_Outcome)
+
+rna_combined <-
+  rna_combined %>%
+  filter(Condition == "Pre") %>%
+  select(-sample, -Dog_Name, -Breed, -`BDI outcome`, -Condition) %>%
+  rename(ClinicalOutcome = Clinical_Outcome)
+
+canine$X1 <- NULL
+canine$BDIOutcme <- NULL
+
+rm(rna)
+
+```
+
+## Variable information 
+
+```{r variable_information}
+bdi_auroc <-
+  canine %>%
+  summarise_if(is.numeric,
+               ~ roc.curve(.[canine$ClinicalOutcome == "Sensitive"],
+                           .[canine$ClinicalOutcome == "Resistant"])$auc) %>%
+  gather %>% 
+  arrange(desc(value))
+
+bdi_auprc <-
+  canine %>%
+  summarise_if(is.numeric,
+               ~ pr.curve(.[canine$ClinicalOutcome == "Sensitive"],
+                          .[canine$ClinicalOutcome == "Resistant"])$auc.integral) %>%
+  gather %>%
+  arrange(desc(value))
+
+rna_combined_auroc <-
+  rna_combined %>%
+  summarise_if(is.numeric,
+               ~ roc.curve(.[canine$ClinicalOutcome == "Sensitive"],
+                           .[canine$ClinicalOutcome == "Resistant"])$auc) %>%
+  gather %>% 
+  arrange(desc(value))
+
+rna_combined_auprc <-
+  rna_combined %>%
+  summarise_if(is.numeric,
+               ~ pr.curve(.[rna_combined$ClinicalOutcome == "Sensitive"],
+                          .[rna_combined$ClinicalOutcome == "Resistant"])$auc.integral) %>%
+  gather %>%
+  arrange(desc(value))
+
+
+```
+
+### BDI variables AUROC
+
+```{r bdi_auroc}
+bdi_auroc
+bdi_auroc %>% write_csv("tables/bdi_auroc.csv")
+```
+
+### BDI variables AUPR curve
+
+```{r bdi_auprc}
+bdi_auprc
+bdi_auroc %>% write_csv("tables/bdi_auprc.csv")
+```
+
+### RNA variables ROC curve
+
+```{r rna_auroc}
+rna_combined_auroc
+rna_combined_auroc %>% write_csv("tables/rna_auroc.csv")
+```
+
+### RNA variables PR curve
+
+```{r rna_auprc}
+rna_combined_auprc
+rna_combined_auprc %>% write_csv("tables/rna_auprc.csv")
+```
+
+## Initial modelling attempt
+
+Attempt to model the data using only the RNA-seq variables and BDI by themselves using regularized logistic regression and Leave-one-out cross validation and k-fold cross validation. These attempts do not yield any sets of hyperparameters which give a perfect classifier.
+
+```{r initial_attempt_pure_variable_sets, message = FALSE, warning=FALSE}
+loocv_training_helper <- function(data, method = "regLogistic", preP = c("center", "scale")) {
+  train(
+    factor(ClinicalOutcome) ~ .,
+    data,
+    trControl = trainControl("LOOCV"),
+    preProcess = preP,
+    method = method
+  )
+}
+
+set.seed(12345)
+
+rna_all_model <-
+  loocv_training_helper(rna_all %>% select(-old_Sample_ID))
+
+rna_pre_model <-
+  loocv_training_helper(rna_pre %>% select(-old_Sample_ID))
+
+rna_combined_model <-
+  loocv_training_helper(rna_combined %>% select(-old_Sample_ID))
+
+rna_combined_top_5 <-
+  loocv_training_helper(rna_combined %>% select(ClinicalOutcome,
+                                                ENSCAFG00000004237, ENSCAFG00000029984,
+                                                ENSCAFG00000005330, ENSCAFG00000016518,
+                                                ClinicalOutcome))
+
+bdi_model <-
+  loocv_training_helper(canine %>% select(-SampleName))
+
+bdi_top03_model <- canine %>% select(LOF0_chop, ALLF1_pred, SDIP1_dox, ClinicalOutcome) %>% loocv_training_helper()
+```
+
+### Using only BDI variables
+
+```{r bdi_only_print}
+bdi_top03_model$results %>% arrange(desc(Kappa))
+bdi_top03_model$results %>% write_csv("tables/bdi_best3_loocv.csv")
+
+bdi_model$results %>% arrange(desc(Kappa))
+bdi_model$results %>% write_csv("tables/bdi_loocv.csv")
+```
+
+### Using only RNA variables
+
+```{r rna_only_print}
+rna_combined_model$results %>% arrange(desc(Kappa))
+rna_combined_model$results %>% write_csv("tables/rna_all_loocv.csv")
+
+rna_combined_top_5$results %>% arrange((desc(Kappa)))
+rna_combined_model$results %>% write_csv("tables/rna_top5_loocv.csv")
+```
+
+## Combine RNA and BDI
+
+```{r bdi_rna_combine_models}
+
+bdi_rna_combined <- merge(canine %>% select(-ClinicalOutcome),
+                          rna_combined,
+                          by.x = "SampleName", by.y = "old_Sample_ID")
+
+set.seed(12345)
+
+bdi_rna_combined %>%
+  select(-SampleName) %>%
+  loocv_training_helper() ->
+  bdi_rna_all
+
+set.seed(12345)
+
+bdi_small_rna_all <-
+  canine %>%
+  select(LOF0_chop, ALLF1_pred, SDIP1_dox, SampleName) %>%
+  merge(rna_combined, by.x = "SampleName", by.y = "old_Sample_ID") %>%
+  select(-SampleName) %>%
+  loocv_training_helper()
+
+bdi_rna_select <-
+  bdi_rna_combined %>%
+  select(LOF0_chop, ALLF1_pred, SDIP1_dox,
+        ENSCAFG00000004237, ENSCAFG00000029984,
+        ENSCAFG00000005330, ENSCAFG00000016518,
+        ClinicalOutcome, SampleName)
+
+set.seed(12345)
+
+bdi_rna_select_model <-
+  bdi_rna_select %>%
+  select(-SampleName) %>%
+  loocv_training_helper()
+
+set.seed(12345)
+
+bdi_rna_select_no_preprocess <-
+  bdi_rna_select %>%
+  select(-SampleName) %>%
+  loocv_training_helper(preP = NULL)
+
+set.seed(12345)
+
+rna_to_use <- c(
+  "ENSCAFG00000004237", "ENSCAFG00000029984",
+  "ENSCAFG00000005330", "ENSCAFG00000016518"
+  )
+
+pp <- list(
+  center = rna_to_use,
+  scale = rna_to_use
+  )
+
+bdi_rna_select_special_preprocess <-
+  bdi_rna_select %>%
+  select(-SampleName) %>%
+  loocv_training_helper(preP = pp)
+
+pp_2 <- list(
+  center = rna_to_use,
+  scale = c(rna_to_use,"ALLF1_pred", "SDIP1_dox", "LOF0_chop")
+  )
+
+bdi_rna_select_special_preprocess_2 <-
+  bdi_rna_select %>%
+  select(-SampleName) %>%
+  loocv_training_helper(preP = pp_2)
+
+```
+
+### All BDI and all RNA variables
+
+```{r all_combined}
+bdi_rna_all$results
+bdi_rna_all$results$Kappa %>% max()
+
+bdi_small_rna_all$results
+bdi_small_rna_all$results$Kappa %>% max()
+```
+
+### Selected BDI and RNA variables using the AUPRC metric
+
+```{r select_combined}
+bdi_rna_select_model$results
+bdi_rna_select_no_preprocess$results
+bdi_rna_select_special_preprocess$results
+bdi_rna_select_special_preprocess_2$results
+
+bdi_rna_select_model$results$Kappa %>% max
+bdi_rna_select_no_preprocess$results$Kappa %>% max
+bdi_rna_select_special_preprocess$results$Kappa %>% max
+bdi_rna_select_special_preprocess_2$results$Kappa %>% max
+
+bdi_rna_select_model$results %>% write_csv("tables/bdi_rna_loocv.csv")
+bdi_rna_select_no_preprocess$results %>% write_csv("tables/bdi_rna_no_norm.csv")
+bdi_rna_select_special_preprocess$results %>% write_csv("tables/bdi_rna_no_bdi_norm.csv")
+bdi_rna_select_special_preprocess_2$results %>% write_csv("tables/bdi_rna_no_center.csv")
+
+```
+
+## Variable Analyis
+
+```{r variable_analysis, fig.height=5, fig.width=6, fig.ext="svg", dev="svg"}
+rna_all %>%
+  ggplot(aes(ENSCAFG00000004237, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1, dotsize = 3) +
+  geom_label_repel(aes(ENSCAFG00000004237, 0.1, label=old_Sample_ID), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+rna_all %>%
+  ggplot(aes(ENSCAFG00000016518, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1) +
+  geom_label_repel(aes(ENSCAFG00000016518, 0.1, label=old_Sample_ID), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+rna_all %>%
+  ggplot(aes(ENSCAFG00000005330, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1, dotsize = 3) +
+  geom_label_repel(aes(ENSCAFG00000005330, 0.1, label=old_Sample_ID), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+rna_all %>%
+  ggplot(aes(ENSCAFG00000029984, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1, dotsize = 3) +
+  geom_label_repel(aes(ENSCAFG00000023923, 0.1, label=old_Sample_ID), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+canine %>%
+  ggplot(aes(LOF0_chop, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1, dotsize = 3) +
+  geom_label_repel(aes(LOF0_chop, 0.1, label=SampleName), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+canine %>%
+  ggplot(aes(ALLF1_pred, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1) +
+  geom_label_repel(aes(ALLF1_pred, 0.1, label=SampleName), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+
+canine %>%
+  ggplot(aes(SDIP1_dox, fill = ClinicalOutcome)) +
+  geom_dotplot(binwidth = 0.1) +
+  geom_label_repel(aes(SDIP1_dox, 0.1, label=SampleName), size = 3) +
+  coord_cartesian(ylim = c(0, 0.2)) +
+  cowplot::theme_cowplot()
+```
+
+## Leave one out testings (LOOT)
+
+### LOOT function
+
+```{r loot_function}
+loot <- function(data, method = "regLogistic", preP = c("center", "scale")) {
+  lapply(data$SampleName, function(X) {
+
+    trn_vald_data <- data %>% filter(SampleName != X)
+
+    train(
+      factor(ClinicalOutcome) ~ .,
+      method = method,
+      trControl = trainControl("LOOCV"),
+      data = trn_vald_data %>% select(-SampleName),
+      preProcess = preP
+    ) -> regLogiticModel
+    
+    pred = predict(regLogiticModel,
+                     data %>% filter(SampleName == X)) %>% as.character()
+    truth = (data %>% filter(SampleName == X))$ClinicalOutcome %>% as.character()
+    
+    self_score = sum(
+      predict(
+        regLogiticModel,
+        data %>% filter(SampleName != X)
+      ) ==
+        (data %>% filter(SampleName != X))$ClinicalOutcome
+    )
+    
+    validation_kappa <- regLogiticModel$results$Kappa %>% max()
+    
+    tibble(pred, truth, X, self_score, validation_kappa)
+  }) %>% bind_rows()
+}
+```
+
+### Run LOOT on all the data frames
+
+```{r run_loot}
+
+set.seed(12345)
+
+bdi_s.loocv <-
+  canine %>%
+  loot()
+
+set.seed(12345)
+
+bdi_top_sloocv <-
+  bdi_rna_select %>%
+  select(ALLF1_pred, LOF0_chop, SDIP1_dox,
+         SampleName, ClinicalOutcome) %>%
+  loot()
+
+set.seed(12345)
+
+rna_combined_s.loocv <-
+  rna_combined %>%
+  rename(SampleName = old_Sample_ID) %>%
+  loot()
+
+set.seed(12345)
+
+rna_subset_loot <-
+  rna_combined %>%
+  select(ENSCAFG00000004237, ENSCAFG00000029984,
+         ENSCAFG00000005330, ENSCAFG00000016518,
+         ClinicalOutcome, old_Sample_ID) %>%
+  rename(SampleName = old_Sample_ID) %>%
+  loot()
+
+set.seed(12345)
+
+bdi_rna_combined_s.loocv <-
+  bdi_rna_select %>%
+  loot()
+
+set.seed(12345)
+
+bdi_rna_combined_no_norm_s.loocv <-
+  bdi_rna_select %>%
+  loot(preP = NULL)
+
+set.seed(12345)
+
+bdi_rna_combined_ENSCAFG_norm_s.loocv <-
+  bdi_rna_select %>%
+  loot(preP = pp)
+
+set.seed(12345)
+
+bdi_rna_combined_special_norm_2.loot <-
+  bdi_rna_select %>%
+  loot(preP = pp_2)
+
+```
+
+### Print results
+
+```{r print_s_loocv_results, warning=FALSE, message=FALSE}
+
+summarize_result <- function(df, name) {
+  my_table <- table(df$pred, df$truth)
+  cm <- caret::confusionMatrix(my_table)
+  
+  res1 <- cm$byClass %>% enframe %>% rename(!!name := value)
+  bind_rows(res1,
+            cm$overall  %>% enframe %>% rename(!!name := value),
+            tibble(name = "Average Validation Kappa", !!name := mean(df$validation_kappa)),
+  )
+}
+
+all_loot_results <-
+  bind_rows(
+    bdi_s.loocv %>% mutate(input = "All BDI variables"),
+    bdi_top_sloocv %>% mutate(input = "Top 3 BDI variables"),
+    rna_combined_s.loocv %>% mutate(input = "All RNA variables"),
+    rna_subset_loot %>% mutate(input = "Top 5 RNA variables"),
+    bdi_rna_combined_s.loocv %>% mutate(input = "BDI and RNA variables w/ all normalization"),
+    bdi_rna_combined_no_norm_s.loocv %>% mutate(input =  "BDI and RNA variables w/o normalization"),
+    bdi_rna_combined_ENSCAFG_norm_s.loocv %>% mutate(input = "BDI and RNA variables w/ RNA normalization"),
+    bdi_rna_combined_special_norm_2.loot %>% mutate(input = "BDI scaled and RNA variable w/ RNA normalization")
+  ) %>% select('input', everything())
+
+loot_summary <- 
+  summarize_result(bdi_s.loocv, "All BDI variables") %>%
+  inner_join(summarize_result(bdi_top_sloocv, "Top 3 BDI variables")) %>%
+  inner_join(summarize_result(rna_combined_s.loocv, "All RNA variables")) %>%
+  inner_join(summarize_result(rna_subset_loot, "Top 5 RNA variables")) %>%
+  inner_join(summarize_result(bdi_rna_combined_s.loocv, "BDI and RNA variables w/ all normalization")) %>%
+  inner_join(summarize_result(bdi_rna_combined_no_norm_s.loocv, "BDI and RNA variables w/o normalization")) %>%
+  inner_join(summarize_result(bdi_rna_combined_ENSCAFG_norm_s.loocv, "BDI and RNA variables w/ RNA normalization")) %>%
+  inner_join(summarize_result(bdi_rna_combined_special_norm_2.loot, "BDI scaled and RNA variable w/ RNA normalization"))
+
+loot_summary %>%
+  gather(key, value, -name) %>%
+  spread(name, value) %>%
+  arrange(Accuracy) %>%
+  select(key, Accuracy, Precision, Recall, F1, Kappa, `Average Validation Kappa`) ->
+  loot_summary
+
+all_loot_results
+loot_summary
+
+all_loot_results %>% write_csv("tables/all_loot_results.csv")
+loot_summary %>% write_csv("tables/all_loot_summary.csv")
+```
+
+## ENSEMBL to Gene name
+
+Create an object to map the *ENSEMBL* genes to gene names if the file *annotations.csv* does not exist. This is done in a manner that prevents a reliance on the biomaRt package as it is not in CRAN.
+
+```{r get_annotations, message = FALSE, warning=FALSE}
+if(file.exists("annotations.csv")) {
+  annotations = read_csv("annotations.csv")
+  annotations$external_gene_name[is.na(annotations$external_gene_name)] = annotations$ensembl_gene_id[is.na(annotations$external_gene_name)]
+} else {
+  ensembl = biomaRt::useMart(
+    biomart = "ENSEMBL_MART_ENSEMBL",
+    dataset="cfamiliaris_gene_ensembl",
+    host = 'www.ensembl.org',
+    ensemblRedirect = FALSE
+  )
+
+  annotations = biomaRt::getBM(c("ensembl_gene_id", "external_gene_name"), mart = ensembl)
+
+  # Remove this object so that the saved session does not depend on biomaRt
+  rm(ensembl)
+}
+```
+
+## Correlation plot
+
+A correlation between **RNA-seq** and **BDI** variables is produced by the following function. 
+
+```{r Correlation of BDI and RNAseq, fig.height=7, fig.width=6, fig.ext="svg", dev="svg"}
+
+create_correlation_plot <- function(data, method = "spearman") {
+
+  data %>%
+    select(-ClinicalOutcome,
+           -SampleName) %>%
+    as.matrix() %>%
+    cor(method = method) %>%
+    as.data.frame() %>%
+    rownames_to_column(var = 'var1') %>%
+    gather(var2, value, -var1) %>%
+    filter(grepl('ENSCAFG', var2),
+           !grepl('ENSCAFG', var1)) %>%
+    merge(annotations,
+          by.x='var2',
+          by.y = 'ensembl_gene_id',
+          all.x = T) %>%
+    mutate(external_gene_name = if_else(is.na(external_gene_name), var2, external_gene_name)) %>%
+    mutate(external_gene_name = gsub("ENSCAFG000000", "E_", external_gene_name))->
+    named_correlations
+
+  named_correlations %>%
+    dplyr::select(-var2) %>%
+    spread('var1', value) -> corr.spread
+
+  corr.spread %>%
+    dplyr::select(-external_gene_name) %>%
+    as.matrix() ->
+    corr.matrix
+
+  rownames(corr.matrix) <- corr.spread$external_gene_name
+
+  corr.clust <- hclust(d = dist(x = corr.matrix)) %>% as.dendrogram() %>% order.dendrogram()
+  corr.clust2 <- hclust(d = dist(x = corr.matrix %>% t)) %>% as.dendrogram() %>% order.dendrogram()
+
+  named_correlations %>%
+    mutate(external_gene_name = factor(external_gene_name,
+                                     levels = corr.spread$external_gene_name[corr.clust])) %>%
+    mutate(var1 = factor(var1,
+                         levels = colnames(corr.matrix)[corr.clust2] )) %>%
+    ggplot(aes(var1, external_gene_name, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient2(limits = c(-1.0, 1.0), low = muted("blue"), high = muted("red")) +
+    labs(x = "BDI Variable", y = "RNA-seq variable", fill = paste0(method,"\ncorrelation")) +
+    cowplot::theme_cowplot() +
+    theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = .5))
+}
+
+bdi_small_2 <-
+  canine %>%
+  gather(key, value, -SampleName, -ClinicalOutcome) %>%
+  filter(key %in% c("SampleName", bdi_auprc$key[1:20])) %>%
+  spread(key, value)
+
+bdi_rna_combined_2 <- merge(bdi_small_2 %>% select(-ClinicalOutcome),
+                          rna_combined,
+                          by.x = "SampleName", by.y = "old_Sample_ID")
+
+
+create_correlation_plot(bdi_rna_combined_2, "spearman")
+create_correlation_plot(bdi_rna_combined_2, "pearson")
+create_correlation_plot(bdi_rna_combined_2, "kendall")
+```
+
+```{r make_output_correlation_figures, message=FALSE}
+pdf("figures/correlation.pdf", width = 6, height = 7)
+create_correlation_plot(bdi_rna_combined_2, "pearson")
+create_correlation_plot(bdi_rna_combined_2, "spearman")
+create_correlation_plot(bdi_rna_combined_2, "kendall")
+dev.off()
+```
+
+```{r cleanup_correlation_plots}
+rm(bdi_small_2)
+rm(bdi_rna_combined_2)
+```
+
+## PCA plots
+
+```{r PCA_plots, fig.width=6, fig.height=7, fig.ext="svg", dev="svg"}
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  prcomp(center = T, scale =T ) %>%
+  ggbiplot(
+    groups = bdi_rna_combined$ClinicalOutcome,
+    labels = bdi_rna_combined$SampleName,
+    ellipse = T
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected variables, normalized")
+
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  prcomp() %>%
+  ggbiplot(
+    groups = bdi_rna_combined$ClinicalOutcome,
+    labels = bdi_rna_combined$SampleName,
+    ellipse = T
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected variables, not normalized")
+
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  mutate(ENSCAFG00000004237 = scale(ENSCAFG00000004237),
+         ENSCAFG00000029984 = scale(ENSCAFG00000029984),
+         ENSCAFG00000005330 = scale(ENSCAFG00000005330),
+         ENSCAFG00000016518 = scale(ENSCAFG00000016518),
+         ALLF1_pred = ALLF1_pred,
+         LOF0_chop = LOF0_chop,
+         SDIP1_dox = SDIP1_dox) %>%
+  prcomp() %>%
+  ggbiplot(
+    groups = bdi_rna_combined$ClinicalOutcome,
+    labels = bdi_rna_combined$SampleName,
+    ellipse = T
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected variables, RNA normalized")
+
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  mutate(ENSCAFG00000004237 = scale(ENSCAFG00000004237),
+         ENSCAFG00000029984 = scale(ENSCAFG00000029984),
+         ENSCAFG00000005330 = scale(ENSCAFG00000005330),
+         ENSCAFG00000016518 = scale(ENSCAFG00000016518),
+         ALLF1_pred = scale(ALLF1_pred, center = F),
+         LOF0_chop = scale(LOF0_chop, center = F),
+         SDIP1_dox = scale(SDIP1_dox, center = F)) %>%
+  prcomp() %>%
+  ggbiplot(
+    groups = bdi_rna_combined$ClinicalOutcome,
+    labels = bdi_rna_combined$SampleName,
+    ellipse = T
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected variables, no BDI centering")
+
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  mutate(ENSCAFG00000004237 = scale(ENSCAFG00000004237),
+         ENSCAFG00000029984 = scale(ENSCAFG00000029984),
+         ENSCAFG00000005330 = scale(ENSCAFG00000005330),
+         ENSCAFG00000016518 = scale(ENSCAFG00000016518),
+         ALLF1_pred = scale(ALLF1_pred, scale = F),
+         LOF0_chop = scale(LOF0_chop, scale = F),
+         SDIP1_dox = scale(SDIP1_dox, scale = F)) %>%
+  prcomp() %>%
+  ggbiplot(
+    groups = bdi_rna_combined$ClinicalOutcome,
+    labels = bdi_rna_combined$SampleName,
+    ellipse = T
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected variables, no BDI scaling")
+
+canine %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+  prcomp(center = T, scale = T) %>%
+  ggbiplot(
+    groups = canine$ClinicalOutcome,
+    labels = canine$SampleName
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("All BDI variables")
+
+bdi_rna_select %>%
+  select(ALLF1_pred, LOF0_chop, SDIP1_dox) %>%
+  prcomp(center = T, scale = T) %>%
+  ggbiplot(
+    groups = canine$ClinicalOutcome,
+    labels = canine$SampleName
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected BDI variables")
+
+bdi_rna_select %>%
+  select(ENSCAFG00000004237, ENSCAFG00000005330,
+         ENSCAFG00000029984, ENSCAFG00000016518) %>%
+  prcomp(center = T, scale = T) %>%
+  ggbiplot(
+    groups = canine$ClinicalOutcome,
+    labels = canine$SampleName
+  ) +
+  cowplot::theme_cowplot() +
+  ggtitle("Selected RNA variables")
+
+rna_combined %>%
+  select(-ClinicalOutcome, -old_Sample_ID) %>%
+  prcomp(center = T, scale = T) %>%
+  ggbiplot(
+    groups = rna_combined$ClinicalOutcome,
+    labels = rna_combined$old_Sample_ID
+  ) +
+  cowplot::theme_cowplot()+
+  ggtitle("All RNA variables")
+```
+
+### PCA in 3D
+
+```{r PCA_3D, webgl=TRUE}
+bdi_rna_select %>%
+  select(-ClinicalOutcome, -SampleName) %>%
+     prcomp(center = T, scale =T ) %>%
+     pca3d::pca3d(group = bdi_rna_combined$ClinicalOutcome)
+```
+
+# Save Everything out
+
+```{r save_everything_out}
+save.image(file="knitr.rda")
+
+bdi_rna_select_special_preprocess$finalModel$W %>%
+  as_tibble %>%
+  write_csv("tables/model_weights.csv")
+```

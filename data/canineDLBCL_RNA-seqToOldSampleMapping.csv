@@ -1,0 +1,35 @@
+sample,Condition,Dog_Name,old_Sample_ID,Clinical_Outcome,BDI outcome,Breed
+12BDI,Pre,Apollo,LY05,Sensitive,Sensitive,Mixed breed dog
+31BDI,Post,Bailey,LY04,Sensitive,Sensitive,German shepherd
+100BDI,Pre,Bailey,LY04,Sensitive,Sensitive,German shepherd
+80BDI,Pre,Bella,Ly43BD,Sensitive,Sensitive,Golden retriever
+RL84BD,Post,Boost,Ly58BD,Resistant,Resistant,Great Dane
+RL60BD,Pre,Boost,Ly58BD,Resistant,Resistant,Great Dane
+95BDI,Pre,Chester,Ly51CL,Sensitive,Sensitive,Basset hound
+21BDI,Post,Clinton,LY03,Sensitive,Resistant,Bloodhound
+RL52CC,Pre,Clinton,LY03,Sensitive,Resistant,Bloodhound
+LY12CW,Post,Cody,case782-104,Sensitive,Sensitive,Rottweiler
+75BDI,Pre,Cody,case782-104,Sensitive,Sensitive,Rottweiler
+16BDI,Post,Cooper,LY02,Resistant,Resistant,Bernese mountain dog
+42BDI,Pre,Cooper,LY02,Resistant,Resistant,Bernese mountain dog
+RL06CJ,Post,Crash,Ly42GJ,Sensitive,Sensitive,Mixed breed dog
+LY54CJ,Pre,Crash,Ly42GJ,Sensitive,Sensitive,Mixed breed dog
+RL46JD,Post,Jojo,LY08,Sensitive,Resistant,Standard poodle
+LY11JD,Pre,Jojo,LY08,Sensitive,Resistant,Standard poodle
+LY29JW,Post,Juliette,LY01,Resistant,Sensitive,Mastiff
+LY16JW,Pre,Juliette,LY01,Resistant,Sensitive,Mastiff
+96BDI,Post,Kane,LY06,Resistant,Resistant,Rottweiler
+RL10KM,Pre,Kane,LY06,Resistant,Resistant,Rottweiler
+RL82KG,Post,Kody,case785-528,Sensitive,Sensitive,Golden retriever
+RL69KG,Pre,Kody,case785-528,Sensitive,Sensitive,Golden retriever
+RL89LB,Post,Lovey,case786-844,Resistant,Resistant,Mixed breed dog
+LY99LB,Pre,Lovey,case786-844,Resistant,Resistant,Mixed breed dog
+LY72MS,Post,Murphy,Ly83MS,Sensitive,Sensitive,Mixed breed dog
+43BDI,Pre,Murphy,Ly83MS,Sensitive,Sensitive,Mixed breed dog
+LY79SM,Post,Scooby-Doo,LY10,Sensitive,Sensitive,Mixed breed dog
+LY54SM,Pre,Scooby-Doo,LY10,Sensitive,Sensitive,Mixed breed dog
+LY49SP,Post,Scout,LY09,Resistant,Resistant,Mixed breed dog
+37BDI,Pre,Scout,LY09,Resistant,Resistant,Mixed breed dog
+LY17TT,Post,Tyson,LY07,Sensitive,Sensitive,Mixed breed dog
+94BDI,Pre,Tyson,LY07,Sensitive,Sensitive,Mixed breed dog
+RL02YB,Pre,Yuma,Ly01YB,Sensitive,Sensitive,Mixed breed dog
